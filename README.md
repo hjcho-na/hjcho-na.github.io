@@ -250,3 +250,276 @@ H100 GPU
 
 원하시면 다음 단계로
 👉 **이 가속기 분류를 자동으로 묶어서 (CPU / GPU-mid / GPU-high / TPU) speedup 표를 만드는 코드**까지 바로 이어서 만들어 드릴 수 있습니다.
+
+
+
+**질문 요약**
+제시하신 “Benchmark Logger 전체 코드” 흐름(옵션 import, `get_hw_info()`, `stage_start/end`)을 유지하면서, 코랩의 7종 가속기(CPU, H100/A100/L4/T4, v6e-1/v5e-1 TPU)를 **안전하게 판별·기록**하도록 코드를 “전체 맥락에 맞게” 수정해 달라는 요청입니다.
+
+---
+
+## 수정 방향
+
+* `pynvml`이 없거나 GPU가 없는 런타임에서도 **절대 에러 없이** 동작
+* TPU 런타임에서도 **GPU 조회 시도 때문에 에러나지 않도록** 분기
+* TPU 판별은 **jax → tensorflow → env var** 순서로 “있으면 기록” (없으면 Unknown)
+* 최종적으로 `get_hw_info()`가 아래 필드를 항상 포함하도록 정리
+
+  * `accelerator_type`: `cpu|gpu|tpu`
+  * `accelerator_class`: `CPU|H100 GPU|A100 GPU|L4 GPU|T4 GPU|v6e-1 TPU|v5e-1 TPU|Unknown GPU|Unknown TPU`
+  * `accelerator_model`: 모델/디바이스 문자열(가능할 때)
+  * (GPU일 때) `gpu_name`, `gpu_mem_total_gb`
+
+---
+
+## ✅ 통째로 교체해서 쓰는 “안전한 Benchmark Logger” 코드
+
+아래 코드를 **그대로 복사해서 기존 logger 셀 전체를 교체**하시면 됩니다.
+
+```python
+# ====== Benchmark Logger (Colab/Local) ======
+import os, json, time, platform, socket
+from datetime import datetime
+
+def _now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# Optional imports (never hard-fail)
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import pynvml
+    pynvml.nvmlInit()
+except Exception:
+    pynvml = None
+
+
+# -----------------------------
+# Accelerator detection helpers
+# -----------------------------
+def _classify_gpu_name(gpu_name: str) -> str:
+    """Map GPU model name string to one of required classes."""
+    if not gpu_name:
+        return "Unknown GPU"
+    n = gpu_name.upper()
+    if "H100" in n:
+        return "H100 GPU"
+    if "A100" in n:
+        return "A100 GPU"
+    if "L4" in n:
+        return "L4 GPU"
+    if "T4" in n:
+        return "T4 GPU"
+    return "Unknown GPU"
+
+
+def _detect_tpu_class_and_model():
+    """
+    Try to detect TPU type (v6e-1 / v5e-1) and return (class, model_string).
+    This must NEVER raise.
+    """
+    # 1) JAX (best effort)
+    try:
+        import jax
+        devs = jax.devices()
+        # dev.platform: 'tpu' / 'gpu' / 'cpu'
+        if any(getattr(d, "platform", None) == "tpu" for d in devs):
+            model = str(devs[0])
+            s = model.lower()
+            if "v6e" in s:
+                return "v6e-1 TPU", model
+            if "v5e" in s:
+                return "v5e-1 TPU", model
+            return "Unknown TPU", model
+    except Exception:
+        pass
+
+    # 2) TensorFlow fallback
+    try:
+        import tensorflow as tf
+        devs = tf.config.list_logical_devices()
+        if any(getattr(d, "device_type", "").upper() == "TPU" for d in devs):
+            # TF만으로는 v5e/v6e를 정확히 못 박기 어려운 경우가 많음
+            return "Unknown TPU", "TPU"
+    except Exception:
+        pass
+
+    # 3) Environment variable hints (best effort, may vary)
+    try:
+        tpu_name = os.environ.get("TPU_NAME") or os.environ.get("COLAB_TPU_ADDR")
+        if tpu_name:
+            s = str(tpu_name).lower()
+            if "v6e" in s:
+                return "v6e-1 TPU", str(tpu_name)
+            if "v5e" in s:
+                return "v5e-1 TPU", str(tpu_name)
+            return "Unknown TPU", str(tpu_name)
+    except Exception:
+        pass
+
+    return None, None
+
+
+def get_accelerator_info():
+    """
+    Return accelerator info dict:
+      - accelerator_type: cpu|gpu|tpu
+      - accelerator_class: one of the 7 classes (or Unknown GPU/TPU)
+      - accelerator_model: best-effort model string
+      - gpu_name, gpu_mem_total_gb when GPU is present
+    """
+    info = {
+        "accelerator_type": "cpu",
+        "accelerator_class": "CPU",
+        "accelerator_model": "CPU",
+    }
+
+    # 1) GPU (NVML)
+    if pynvml is not None:
+        try:
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            gpu_name = pynvml.nvmlDeviceGetName(h).decode("utf-8", errors="ignore")
+            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+
+            info.update({
+                "accelerator_type": "gpu",
+                "accelerator_class": _classify_gpu_name(gpu_name),
+                "accelerator_model": gpu_name,
+                "gpu_name": gpu_name,
+                "gpu_mem_total_gb": round(mem.total / (1024**3), 2),
+            })
+            return info
+        except Exception:
+            # NVML exists but can't read GPU (rare). Fall through to TPU/CPU checks.
+            pass
+
+    # 2) TPU (JAX/TF/env)
+    tpu_class, tpu_model = _detect_tpu_class_and_model()
+    if tpu_class is not None:
+        info.update({
+            "accelerator_type": "tpu",
+            "accelerator_class": tpu_class,
+            "accelerator_model": tpu_model if tpu_model else "TPU",
+        })
+        return info
+
+    # 3) CPU fallback
+    return info
+
+
+# -----------------------------
+# Hardware info for logging
+# -----------------------------
+def get_hw_info():
+    info = {
+        "timestamp": _now(),
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "runtime_hint": "colab" if os.path.exists("/content") else "local",
+    }
+
+    # CPU/RAM
+    if psutil:
+        try:
+            vm = psutil.virtual_memory()
+            info.update({
+                "cpu_logical": psutil.cpu_count(logical=True),
+                "ram_total_gb": round(vm.total / (1024**3), 2),
+            })
+        except Exception:
+            pass
+
+    # Accelerator info (CPU/GPU/TPU + class/model)
+    info.update(get_accelerator_info())
+
+    return info
+
+
+# -----------------------------
+# JSONL append
+# -----------------------------
+def append_jsonl(path, record: dict):
+    # NOTE: dirname('file.jsonl') == '' in local relative path case -> handle safely
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# ---- stage start/end ----
+_STAGE_T0 = None
+_STAGE_NAME = None
+
+def stage_start(stage_name: str,
+                log_path: str = "/content/drive/MyDrive/Colab Notebooks/0037_T11_GRSL_merge/experiments/bench/bench_log.jsonl"):
+    global _STAGE_T0, _STAGE_NAME
+    _STAGE_NAME = stage_name
+    _STAGE_T0 = time.perf_counter()
+
+    append_jsonl(log_path, {
+        "stage": stage_name,
+        "event": "start",
+        "t_wall_s": None,
+        **get_hw_info(),
+    })
+    print(f"[bench] START {stage_name}")
+
+def stage_end(log_path: str = "/content/drive/MyDrive/Colab Notebooks/0037_T11_GRSL_merge/experiments/bench/bench_log.jsonl",
+              status: str = "ok"):
+    global _STAGE_T0, _STAGE_NAME
+    if _STAGE_T0 is None or _STAGE_NAME is None:
+        print("[bench] WARNING: stage_end() called without stage_start()")
+        return
+
+    t = time.perf_counter() - _STAGE_T0
+    append_jsonl(log_path, {
+        "stage": _STAGE_NAME,
+        "event": "end",
+        "t_wall_s": round(t, 6),
+        "status": status,
+        **get_hw_info(),
+    })
+    print(f"[bench] END   {_STAGE_NAME} | {t:.3f}s")
+
+    _STAGE_T0 = None
+    _STAGE_NAME = None
+
+
+print("HW:", get_hw_info())
+print("Ready: stage_start('Sxx_name'); ...; stage_end()")
+```
+
+---
+
+## 중요 보완 사항 2가지
+
+### 1) TPU “v6e-1 / v5e-1”은 100% 확정 판별이 항상 가능한가?
+
+* GPU는 NVML로 모델명이 명확해서 **거의 확실**합니다.
+* TPU는 런타임/프레임워크에 따라 device 문자열이 달라 **v5e/v6e가 문자열에 안 뜨는 경우**가 있습니다.
+
+  * 그 경우 `accelerator_class = "Unknown TPU"`로 남게 됩니다.
+  * (그래도 `accelerator_type=tpu`는 안정적으로 판별됩니다.)
+
+> 만약 TPU 세대가 반드시 필요하면, TPU 런타임에서 `jax.devices()` 출력 문자열을 한 번 확인하고, 그 문자열 패턴에 맞춰 매칭 규칙을 더 강화하면 됩니다.
+
+---
+
+### 2) 경로에 `//`가 들어간 부분 정리
+
+원본 코드 경로에 `MyDrive//Colab Notebooks/...`처럼 `//`가 있었는데,
+
+* 대부분 OS에서 자동으로 처리되긴 하지만,
+* 위 코드는 `//`를 제거한 형태로 반영했습니다. (권장)
+
+---
+
+원하시면, 다음을 추가로 바로 만들어드릴게요.
+
+* `accelerator_class`가 **반드시 7개 중 하나**로 떨어지도록(Unknown 없이) “강제 맵핑 규칙”을 더 보수적으로 설정
+* `nvidia-smi`, `jax.devices()`, `tf` 출력까지 함께 저장해서 **논문 재현성 증거 로그**를 더 풍부하게 남기는 확장 버전
